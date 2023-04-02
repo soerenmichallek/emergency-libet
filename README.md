@@ -5,12 +5,12 @@ Psychopy Code, files, and explanations for my modified Libet Clock experiment ru
 
 | File  | Description|
 | ------------- | ------------- |
-| [main folder]/emergency-libets.psyexp  | PsychoPy experiment file for the standalone application|
-| [main folder]/emergency-libet_lastrun.py  | Python code for the experiment |
-| [main folder]/scenarios.xlsx | List of all scenario descriptions in Dutch |
-| [stimuli]/x.ogg | Sound files for scenarios and action words |
-| [stimuli]/x.png/jpg | Pictures for instructions |
-| [conditionfiles]/x.xlsx | Condition files for all practice and experimental trials including critical variables. For use with PsychoPy trial loops. |
+| emergency-libet/emergency-libet.psyexp  | PsychoPy experiment file for the standalone application|
+| emergency-libet/emergency-libet_lastrun.py  | Python code for the experiment |
+| emergency-libet/scenarios.xlsx | List of all scenario descriptions in Dutch |
+| emergency-libet/stimuli/x.ogg | Sound files for scenarios and action words |
+| emergency-libet/stimuli/x.png/jpg | Pictures for instructions |
+| emergency-libet/conditionfiles/x.xlsx | Condition files for all practice and experimental trials including critical variables. For use with PsychoPy trial loops. |
 
 
 
