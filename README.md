@@ -1,6 +1,9 @@
 # emergency-libet
 Psychopy Code, files, and explanations for my modified Libet Clock experiment run in PsychoPy. The main goal of the experiment was to investigate the timing of action awareness in prosocial behavior in 1 victim, 1 bystander emergency scenarios.
 
+# Important:
+Make sure to set the default units of PsychoPy to 'pix'. Otherwise the positioning of the clock elements will be off. To avoid having to do this you could update the clock elements in the clock_init components to set their units argument as whatever you prefer.
+
 # Available Files
 
 | File  | Description|
