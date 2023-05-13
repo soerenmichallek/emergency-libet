@@ -1,0 +1,354 @@
+---
+title: "emergency-libet-analysis"
+author: "Soeren Michallek"
+date: "14.04.2023"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(apaTables)
+library(data.table) 
+library(jtools)
+library(tidyverse)
+library(rstatix)
+library(ez)
+library(psych)
+library(lsr)
+library(afex)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(lattice)
+```
+
+# Loading Data
+```{r}
+setwd("C:/R/thesis/thesisproj/data") # workaround to set the proper path, csv are not readable otherwise. Change this to make the script work on your machine
+
+files <- list.files()
+temp <- lapply(files, fread, sep=",") # this only works if your working directory contains only the .csv files.
+raw_data <- rbindlist(temp, fill = TRUE)
+rm(files)
+rm(temp)
+```
+
+# Data preprocessing
+```{r}
+emergency_libet_data  <- raw_data %>% 
+  
+  select(
+    participant, duration_t1, duration_t2, duration_t3, duration_t4, duration_free, duration_forced  ,soundpath_t1, soundpath_t2, soundpath_t3, soundpath_free, soundpath_t4, soundpath_forced, trial_nr_t1, trial_nr_t2, trial_nr_t3, trial_nr_free, trial_nr_t4, trial_nr_forced,
+         action_word, judgement, response, objective, subj_rating, was_incorrect, likert_1, likert_2, likert_3, scenario_number, danger, relevance, realism
+    ) %>% # PsychoPy output generates lots of irrelevant variables, here we only select the important ones
+  
+  unite(soundpath, contains("soundpath"), sep = "", na.rm = TRUE) %>% # slightly different variable names were used to prevent issues in PsychoPy, but for a clean data set they need to be merged together. 
+  unite(soundpath, soundpath, scenario_number, sep = "", na.rm = TRUE) %>% # same as above
+  unite(trial_nr, contains("trial_nr"), sep = "", na.rm = TRUE) %>% 
+  unite(judgment, judgement, response, sep = "", na.rm = TRUE) %>% 
+  unite(duration, contains("duration"), sep = "", na.rm = TRUE) %>% 
+  
+  mutate(
+    judgment = case_when(str_detect(judgment, "up") ~ "help", # change for easier interpretation
+                              str_detect(judgment, "down") ~ "no_help"), 
+
+         subj_rating = as.numeric(str_remove_all(subj_rating, pattern = "\\D")), # converts objective and subjective judgments from string output with PsychoPy artifacts to simple numeric values
+         objective = as.numeric(str_remove_all(objective, pattern = "[^\\d\\.]")),
+    # Normalizing obj rating timer start to position 0 on the clock
+    norm_obj = case_when(
+        duration == 4 ~ objective,
+        duration == 5 ~ objective,
+        duration == 6 ~ objective,
+        duration == 7 ~ objective,
+        duration == 8 ~ objective),
+# the values which are added/subtracted from the difference score per duration are derived from:
+# duration + 750ms buffer + 1.043s (the time for action words and delays) = x
+# x %/% 2.56 = y
+# x- (y*2.56) = z
+# if z > 1.28: 2.56-z = value, add to objective
+# if z < 1.28: z = value, subtract from objective
+         subj_adj = round((subj_rating * (2.56/60)), digits = 3),
+         obj_adj = round((norm_obj - ((norm_obj %/% 2.56) * 2.56)), digits = 3),
+         difference_score = subj_adj-obj_adj,
+         difference_score = case_when(
+        duration == 4 ~ difference_score - 0.637,
+        duration == 5 ~ difference_score + 0.887,
+        duration == 6 ~ difference_score - 0.113,
+        duration == 7 ~ difference_score - 1.113,
+        duration == 8 ~ difference_score + 0.447),
+         new_diff = case_when(difference_score > 1.28 ~ (difference_score - 2.56), # calculating the difference between objective timing of key press and subjective m judgment
+                              difference_score <= 1.28 & difference_score >= -1.28 ~ difference_score,
+                              difference_score < -1.28 ~ (difference_score + 2.56)
+         ),
+         across(c(likert_1, likert_2), # convert questionnaire answers to 1-5 values
+          ~ case_when(
+           . == "heel slecht" ~ 1,
+           . == "slecht" ~ 2, 
+           . == "redelijk" ~ 3, 
+           . == "goed" ~ 4, 
+           . == "uitstekend" ~ 5
+         )),
+         choice = case_when( # create free vs. forced choice distinction
+      is.na(action_word) ~ "free",
+      !is.na(action_word) ~ "forced",
+    )
+  )
+```
+
+
+# Creating a seperate dataframe for questionnaire data
+```{r}
+  questionnaire <- emergency_libet_data %>% filter(!is.na(danger| relevance | realism)) %>% 
+    select(participant, soundpath, danger, relevance, realism)
+  emergency_libet_data  <- emergency_libet_data %>% filter(is.na(danger| relevance | realism)) %>% 
+    select(-danger, -relevance, -realism)
+```
+
+# Excluding Participants
+```{r}
+# excluding those who were not able to hear the scenarios or immerse themselves in them
+# no exclusions were made in this study, but your mileage might vary.
+exclude_likert <- emergency_libet_data %>% 
+  filter(likert_1 == 1 | likert_2 == 1) %>% 
+  distinct(participant)
+
+emergency_libet_data <- emergency_libet_data %>% 
+  anti_join(exclude_likert)
+  rm(exclude_likert)
+
+# after this we exclude the training trials and training-only variables to make the df more precise
+emergency_libet_data <- emergency_libet_data %>% 
+  filter(str_detect(soundpath, pattern = "training", negate = TRUE)) %>% 
+  drop_na(participant) %>% # remove the empty rows that show that a new csv file is read in
+  select(-likert_1, -likert_2, -likert_3) 
+
+# extracting scenario numbers out of soundpath variable
+  emergency_libet_data <- emergency_libet_data %>% 
+    mutate(scenario = str_remove_all(soundpath, pattern = "stimuli/|\\.ogg"), .before = trial_nr) %>% 
+    select(-soundpath) %>% 
+    mutate(
+      trial_type = as.factor(case_when(
+        str_detect(scenario, pattern = "h") ~ "help",
+        str_detect(scenario, pattern = "n") ~ "no-help"
+      )),
+      
+      scenario = case_when(
+      scenario == "1ha" ~ 1,
+      scenario == "1na" ~ 2,
+      scenario == "2ha" ~ 3,
+      scenario == "2na" ~ 4,
+      scenario == "3ha" ~ 5,
+      scenario == "3na" ~ 6,
+      scenario == "4ha" ~ 7,
+      scenario == "4na" ~ 8,
+      scenario == "5ha" ~ 9,
+      scenario == "5na" ~ 10,
+      scenario == "6ha" ~ 11,
+      scenario == "6na" ~ 12,
+      scenario == "7ha" ~ 13,
+      scenario == "7na" ~ 14,
+      scenario == "8ha" ~ 15,
+      scenario == "8na" ~ 16,
+      scenario == "9ha" ~ 17,
+      scenario == "9na" ~ 18,
+      scenario == "10ha" ~ 19,
+      scenario == "10na" ~ 20,
+      scenario == "11ha" ~ 21,
+      scenario == "11na" ~ 22,
+      scenario == "12ha" ~ 23,
+      scenario == "12na" ~ 24,
+      
+      scenario == "1hb" ~ 25,
+      scenario == "1nb" ~ 26,
+      scenario == "2hb" ~ 27,
+      scenario == "2nb" ~ 28,
+      scenario == "3hb" ~ 29,
+      scenario == "3nb" ~ 30,
+      scenario == "4hb" ~ 31,
+      scenario == "4nb" ~ 32,
+      scenario == "5hb" ~ 33,
+      scenario == "5nb" ~ 34,
+      scenario == "6hb" ~ 35,
+      scenario == "6nb" ~ 36,
+      scenario == "7hb" ~ 37,
+      scenario == "7nb" ~ 38,
+      scenario == "8hb" ~ 39,
+      scenario == "8nb" ~ 40,
+      scenario == "9hb" ~ 41,
+      scenario == "9nb" ~ 42,
+      scenario == "10hb" ~ 43,
+      scenario == "10nb" ~ 44,
+      scenario == "11hb" ~ 45,
+      scenario == "11nb" ~ 46,
+      scenario == "12hb" ~ 47,
+      scenario == "12nb" ~ 48,
+    )) %>% 
+    relocate(trial_type, .before = trial_nr)
+
+# excluding those who failed to press the correct key in 30% or more of the forced trials
+# no exclusions were made in this study, but your mileage might vary.
+exclude_incorrect <- emergency_libet_data %>% 
+  group_by(participant) %>% 
+  filter(sum(was_incorrect, na.rm = TRUE) > 14) %>% 
+  distinct(participant)
+
+emergency_libet_data <- emergency_libet_data %>% 
+  anti_join(exclude_incorrect)
+  rm(exclude_incorrect)
+```
+
+# Excluding trials
+```{r}
+n <- emergency_libet_data %>% 
+  count()
+count_extreme <- emergency_libet_data %>% # count how many trials this will affect
+  filter(new_diff >= 0.640 | new_diff <= -0.640) %>% 
+  count()
+
+count_incorrect <- emergency_libet_data %>% 
+  filter(was_incorrect == TRUE) %>% 
+  count()
+
+count_ten <- emergency_libet_data %>% 
+  filter(norm_obj > 10) %>% 
+  count()
+
+emergency_libet_data <- emergency_libet_data %>%
+  filter(norm_obj < 10, # trials longer than 10s 
+         was_incorrect == FALSE | is.na(was_incorrect)) %>% # incorrect forced trials 
+  filter(new_diff <= 0.640 & new_diff >= -0.640) # exclusion based on inattentiveness
+```
+
+# Analysis
+```{r}
+# Data exploration
+ggplot(emergency_libet_data, aes(x = new_diff)) +
+  geom_histogram() +
+  theme_apa()
+
+ggplot(emergency_libet_data, aes(x = objective)) +
+  geom_histogram() +
+  theme_apa()
+
+ggplot(emergency_libet_data, aes(x = norm_obj)) +
+  geom_histogram() +
+  theme_apa()
+
+# Descriptives
+mean(emergency_libet_data$new_diff)
+sd(emergency_libet_data$new_diff)
+describeBy(new_diff ~ judgment + choice + trial_type, data = emergency_libet_data, mat = TRUE, digits = 3) # descriptives for 2x2x2
+describeBy(new_diff ~ judgment, data = emergency_libet_data, mat = TRUE, digits = 3) # descriptives for judgment only
+describeBy(new_diff ~ choice, data = emergency_libet_data, mat = TRUE, digits = 3) # descriptives for choice only
+describeBy(new_diff ~ trial_type, data = emergency_libet_data, mat = TRUE, digits = 3) # descriptives for trial_type only
+describeBy(new_diff ~ participant, data = emergency_libet_data, mat = TRUE, digits = 3) # descriptives per participant
+
+## obtaining proportions for judgment in free block
+emergency_libet_data %>% 
+  group_by(choice, trial_type, judgment) %>% 
+  summarise(cnt = n()) %>% 
+  mutate(proportion = round(cnt/sum(cnt), 3))
+
+emergency_libet_data$judgment <- as.factor(emergency_libet_data$judgment)
+emergency_libet_data$choice <- as.factor(emergency_libet_data$choice)
+emergency_libet_data$participant <- as.factor(emergency_libet_data$participant)
+emergency_libet_data$scenario <- as.factor(emergency_libet_data$scenario)
+
+# Linear Mixed Model
+modelLM <- lmer(new_diff ~ judgment * trial_type * choice
+              + (1| participant) + (1|scenario), data = emergency_libet_data)
+summary(modelLM)
+confint(modelLM) #this will return the confidence intervals of the betas
+estimated_means <- emmeans(modelLM, list(pairwise ~ choice| trial_type), adjust = "tukey") # pairwise comparisons of the estimates from the choice*trial_type interaction
+emmeans_plot_data <- emmip(estimated_means, choice ~ trial_type, plotit = FALSE)
+
+emmeans_plot_data <- emmeans_plot_data %>%  mutate(
+  choice = case_when(
+    choice == "free" ~ "Free",
+    choice == "forced" ~ "Forced"
+  )
+)
+
+interaction_plot <- ggplot(data = emmeans_plot_data, aes(x=trial_type, y=yvar, group = choice, color=choice)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin=yvar-SE, ymax=yvar+SE), width=0.2) +
+  xlab("Emergency Severity") +
+  ylab("Estimated Means") +
+  theme_apa() +
+  scale_color_grey() +
+  scale_x_discrete(labels = c("High", "Low")) +
+  theme(axis.text.x= element_text(size = 12)) +
+  theme(axis.text.y= element_text(size = 12)) + 
+  theme(text = element_text(family = "serif")) + 
+  theme(legend.text = element_text(size = 12))
+
+ggsave(interaction_plot, dpi = 600, filename = "interactionplot.png")
+                                            
+# Assumption Checks
+
+## Outliers
+#since all values are valid between -1.28 and 1.28, even extreme values are acceptable responses.
+
+## Linearity
+plot(resid(modelLM), emergency_libet_data$new_diff)
+
+## Homogeneity of Variance
+plot(modelLM)
+
+## Normality
+qqmath(modelLM) #id: identifies values that may be exerting undue influence on the model (i.e. outliers)
+```
+# Questionnaire analysis
+```{r}
+# the value 12 denotes missing data
+questionnaire %>% 
+  filter(danger == 12) %>% 
+  count()
+
+questionnaire %>% 
+  filter(realism == 12) %>% 
+  count()
+
+questionnaire %>% 
+  filter(relevance == 12) %>% 
+  count()
+
+questionnaire_final <- questionnaire %>% 
+  filter(danger != 12, realism != 12, relevance != 12) %>%  # removes missing data using listwise deletion
+  mutate(scenario = soundpath, .keep = "unused")
+
+questionnaire_final$scenario <- as.numeric(questionnaire_final$scenario)
+
+questionnaire_final <- questionnaire_final %>% # retrieve emergency severity
+  mutate(trial_type = case_when(
+    scenario %% 2 != 0 ~ "help",
+    scenario %% 2 == 0 ~ "no-help",
+  ))
+questionnaire_final$trial_type <- as.factor(questionnaire_final$trial_type)
+
+questionnaire_final <- questionnaire_final %>%
+  group_by(scenario, trial_type) %>%
+  summarise(mean_realism = mean(realism),
+            sd_realism = sd(realism),
+            mean_danger = mean(danger),
+            sd_danger = sd(danger),
+            mean_relevance = mean(relevance),
+            sd_relevance = sd(relevance))
+
+describe.by(questionnaire_final$mean_danger, group = questionnaire_final$trial_type)
+describe.by(questionnaire_final$mean_realism, group = questionnaire_final$trial_type)
+describe.by(questionnaire_final$mean_relevance, group = questionnaire_final$trial_type)
+
+t.test(mean_danger ~ trial_type, data = questionnaire_final)
+t.test(mean_realism ~ trial_type, data = questionnaire_final)
+t.test(mean_relevance ~ trial_type, data = questionnaire_final)
+
+cohen.d(x = questionnaire_final$mean_danger, group = questionnaire_final$trial_type)
+cohen.d(x = questionnaire_final$mean_realism, group = questionnaire_final$trial_type)
+cohen.d(x = questionnaire_final$mean_relevance, group = questionnaire_final$trial_type)
+```
+
